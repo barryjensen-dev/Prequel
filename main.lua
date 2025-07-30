@@ -1,17 +1,15 @@
--- ♻️ Make Reloadable
+-- ♻️ Safe reload
 if _G.AutoAimScriptLoader and _G.AutoAimScriptLoader.Unload then
 	_G.AutoAimScriptLoader.Unload()
 end
 _G.AutoAimScriptLoader = {}
 
--- ✅ Prevent double-execution
 if _G.AutoAimScriptLoader.Running then return end
 _G.AutoAimScriptLoader.Running = true
 
 -- SERVICES
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 local Teams = game:GetService("Teams")
 local Camera = workspace.CurrentCamera
 local LocalPlayer = Players.LocalPlayer
@@ -22,33 +20,30 @@ local LINE_THICKNESS = 1
 local ROTATE_SPEED = 0.15
 local FIRE_COOLDOWN = 0.3
 local PREDICTION_FACTOR = 1
+local CAMERA_SMOOTHING_FACTOR = 0.15
+local SHAKE_INTENSITY = 0.15
+local AIM_FOV_RADIUS = 200 -- pixels radius around crosshair for valid targets
+local TARGET_PERSIST_TIME = 0.6 -- seconds to persist on same target
 
 -- STATE
-local ESP = {}
-local connections = {}
+local ESP, connections = {}, {}
 local enabled = true
 local hue = 0
 local lastFireTime = 0
 local PROJECTILE_SPEED = 125
+local currentTarget = nil
+local lastTargetChangeTime = 0
 
--- CLEANUP HANDLER
+-- CLEANUP
 function _G.AutoAimScriptLoader.Unload()
-	-- Disconnect connections
-	for _, conn in pairs(connections) do
-		pcall(function() conn:Disconnect() end)
-	end
-	-- Remove ESP
-	for _, lines in pairs(ESP) do
-		for _, line in pairs(lines) do
-			if line and line.Remove then pcall(function() line:Remove() end) end
-		end
-	end
+	for _, conn in pairs(connections) do pcall(function() conn:Disconnect() end) end
+	for _, lines in pairs(ESP) do for _, line in pairs(lines) do if line and line.Remove then pcall(function() line:Remove() end) end end end
 	ESP = {}
 	_G.AutoAimScriptLoader.Running = false
-	print("[AutoAim] Script unloaded.")
+	print("[AutoAim] Unloaded.")
 end
 
--- DRAWING
+-- UTILS
 local function newLine()
 	local success, line = pcall(function()
 		local l = Drawing.new("Line")
@@ -83,30 +78,80 @@ local function createESP(player)
 end
 
 local function removeESP(player)
-	if ESP[player] then
-		for _, line in pairs(ESP[player]) do
-			if line then pcall(function() line:Remove() end) end
-		end
-		ESP[player] = nil
-	end
+	if ESP[player] then for _, line in pairs(ESP[player]) do if line then pcall(function() line:Remove() end) end end end
+	ESP[player] = nil
 end
 
-local function getNearestEnemy()
-	local closest, minDist = nil, math.huge
+-- Checks if target is visible via raycast from camera to target HRP
+local function hasLineOfSight(target)
+	local char = target.Character
+	if not char then return false end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	local origin = Camera.CFrame.Position
+	local direction = (hrp.Position - origin)
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterDescendantsInstances = {LocalPlayer.Character}
+	raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+	local raycastResult = workspace:Raycast(origin, direction, raycastParams)
+	if raycastResult then
+		if raycastResult.Instance:IsDescendantOf(char) then
+			return true
+		end
+		return false
+	end
+	return true
+end
+
+-- Calculates distance in screen pixels between crosshair and target's HRP screen position
+local function screenDistanceToTarget(target)
+	local hrp = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return math.huge end
+	local screenPos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+	if not onScreen then return math.huge end
+	local centerX, centerY = Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2
+	local dx = screenPos.X - centerX
+	local dy = screenPos.Y - centerY
+	return math.sqrt(dx*dx + dy*dy)
+end
+
+-- Gets target's health (or math.huge if can't find)
+local function getTargetHealth(target)
+	local humanoid = target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Health > 0 then
+		return humanoid.Health
+	end
+	return math.huge
+end
+
+-- Gets best target according to health priority, line-of-sight, and FOV radius
+local function getBestTarget()
+	local now = tick()
+	local validTargets = {}
+
 	for _, p in pairs(Players:GetPlayers()) do
 		if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
 			if p.Team == LocalPlayer.Team or LocalPlayer:IsFriendsWith(p.UserId) then continue end
-			local hrp = p.Character.HumanoidRootPart
-			local _, onScreen = Camera:WorldToViewportPoint(hrp.Position)
-			if not onScreen then continue end
-			local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
-			if dist < minDist then
-				minDist = dist
-				closest = p
-			end
+			if not hasLineOfSight(p) then continue end
+			local distToCenter = screenDistanceToTarget(p)
+			if distToCenter > AIM_FOV_RADIUS then continue end
+			table.insert(validTargets, p)
 		end
 	end
-	return closest
+
+	-- If current target is valid and persist timer not expired, keep it
+	if currentTarget and table.find(validTargets, currentTarget) and now - lastTargetChangeTime < TARGET_PERSIST_TIME then
+		return currentTarget
+	end
+
+	-- Otherwise select lowest health target among valid targets
+	table.sort(validTargets, function(a,b)
+		return getTargetHealth(a) < getTargetHealth(b)
+	end)
+
+	currentTarget = validTargets[1]
+	lastTargetChangeTime = now
+	return currentTarget
 end
 
 local function getPredictedPosition(target)
@@ -118,34 +163,6 @@ local function getPredictedPosition(target)
 	return hrp.Position + (velocity * timeToHit * PREDICTION_FACTOR)
 end
 
--- 🧰 Silent Auto-Aim + Fire
-local function autoAimAndFire(target)
-	local char, backpack = LocalPlayer.Character, LocalPlayer:FindFirstChild("Backpack")
-	if not char or not backpack then return end
-
-	local tool
-	for _, t in ipairs(backpack:GetChildren()) do
-		if t:IsA("Tool") and table.find(TOOL_NAMES, t.Name) then tool = t break end
-	end
-	for _, t in ipairs(char:GetChildren()) do
-		if t:IsA("Tool") and table.find(TOOL_NAMES, t.Name) then tool = t break end
-	end
-	if not tool then return end
-
-	-- Equip if not already equipped
-	if not char:FindFirstChild(tool.Name) then
-		char.Humanoid:EquipTool(tool)
-	end
-
-	local now = tick()
-	if now - lastFireTime >= FIRE_COOLDOWN then
-		lastFireTime = now
-		pcall(function()
-			tool:Activate()
-		end)
-	end
-end
-
 local function faceTarget(target)
 	local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
 	local predicted = getPredictedPosition(target)
@@ -155,41 +172,75 @@ local function faceTarget(target)
 	end
 end
 
--- 📏 Auto Projectile Speed Detection
-local function setupProjectileSpeedDetector()
-	local function trackBullet(bullet)
-		local start = bullet.Position
-		local t1 = tick()
-		task.delay(0.1, function()
-			if bullet and bullet.Parent then
-				local speed = (bullet.Position - start).Magnitude / (tick() - t1)
-				if speed > 5 then PROJECTILE_SPEED = speed end
-			end
-		end)
+local function autoAimAndFire(target)
+	local char, backpack = LocalPlayer.Character, LocalPlayer:FindFirstChild("Backpack")
+	if not char or not backpack then return end
+
+	local tool
+	for _, t in ipairs(backpack:GetChildren()) do if t:IsA("Tool") and table.find(TOOL_NAMES, t.Name) then tool = t break end end
+	for _, t in ipairs(char:GetChildren()) do if t:IsA("Tool") and table.find(TOOL_NAMES, t.Name) then tool = t break end end
+	if not tool then return end
+
+	if not char:FindFirstChild(tool.Name) then
+		char.Humanoid:EquipTool(tool)
+		task.wait(0.1)
 	end
-	local folder = workspace:FindFirstChild("GunProjectiles")
-	if folder then table.insert(connections, folder.ChildAdded:Connect(trackBullet)) end
-	table.insert(connections, workspace.ChildAdded:Connect(function(c)
-		if c:IsA("BasePart") and c.Name == "Bullet" then trackBullet(c) end
-	end))
+
+	local now = tick()
+	if now - lastFireTime >= FIRE_COOLDOWN then
+		lastFireTime = now
+		local remote = tool:FindFirstChildWhichIsA("RemoteEvent", true)
+		local predicted = getPredictedPosition(target) or target.Character.HumanoidRootPart.Position
+		if remote then
+			pcall(function() remote:FireServer(predicted) end)
+		else
+			pcall(function() tool:Activate() end)
+		end
+	end
+
+	-- Auto reload
+	local ammo = tool:FindFirstChild("Ammo") or tool:FindFirstChild("Clip")
+	if ammo and ammo:IsA("IntValue") and ammo.Value <= 0 then
+		local reloadRemote = tool:FindFirstChild("Reload") or tool:FindFirstChildWhichIsA("RemoteEvent", true)
+		if reloadRemote then
+			pcall(function() reloadRemote:FireServer() end)
+		else
+			-- Fallback: Send "R" key press (less reliable)
+			local VirtualInputManager = game:GetService("VirtualInputManager")
+			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.R, false, game)
+			task.wait(0.05)
+			VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+		end
+	end
 end
 
--- ⌨️ Toggle Keybind
-table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-	if not gameProcessed and input.KeyCode == Enum.KeyCode.RightControl then
-		enabled = not enabled
-		for _, lines in pairs(ESP) do
-			for _, line in pairs(lines) do
-				if line then line.Visible = enabled end
-			end
-		end
-		print("[AutoAim] Enabled:", enabled)
+-- Camera smoothing + shake
+local camOriginalCFrame = Camera.CFrame
+local function updateCamera()
+	local target = getBestTarget()
+	if not target then
+		Camera.CFrame = Camera.CFrame:Lerp(camOriginalCFrame, CAMERA_SMOOTHING_FACTOR)
+		return
 	end
-end))
 
--- ♾️ Main Loop
-table.insert(connections, RunService.RenderStepped:Connect(function()
-	if not enabled then return end
+	local predicted = getPredictedPosition(target)
+	if not predicted then
+		Camera.CFrame = Camera.CFrame:Lerp(camOriginalCFrame, CAMERA_SMOOTHING_FACTOR)
+		return
+	end
+
+	local lookCFrame = CFrame.lookAt(Camera.CFrame.Position, predicted)
+
+	local shakeX = (math.random() - 0.5) * SHAKE_INTENSITY
+	local shakeY = (math.random() - 0.5) * SHAKE_INTENSITY
+	local shakeZ = (math.random() - 0.5) * SHAKE_INTENSITY
+	local shake = CFrame.new(shakeX, shakeY, shakeZ)
+
+	Camera.CFrame = Camera.CFrame:Lerp(lookCFrame * shake, CAMERA_SMOOTHING_FACTOR)
+end
+
+local hue = 0
+local function updateESP()
 	hue = (hue + 0.005) % 1
 
 	for p, lines in pairs(ESP) do
@@ -227,9 +278,9 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 				end
 			end
 
-			local pos, visible = Camera:WorldToViewportPoint(hrp.Position)
-			lines.Tracer.Visible = visible
-			if visible then
+			local pos, vis = Camera:WorldToViewportPoint(hrp.Position)
+			lines.Tracer.Visible = vis
+			if vis then
 				lines.Tracer.From = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y)
 				lines.Tracer.To = Vector2.new(pos.X, pos.Y)
 			end
@@ -237,15 +288,44 @@ table.insert(connections, RunService.RenderStepped:Connect(function()
 			for _, l in pairs(lines) do l.Visible = false end
 		end
 	end
+end
 
-	local target = getNearestEnemy()
+-- Auto projectile speed detection
+local function setupProjectileSpeedDetector()
+	local function track(bullet)
+		local start = bullet.Position
+		local t0 = tick()
+		task.delay(0.1, function()
+			if bullet and bullet.Parent then
+				local dist = (bullet.Position - start).Magnitude
+				local dt = tick() - t0
+				if dt > 0 then
+					local speed = dist / dt
+					if speed > 5 then PROJECTILE_SPEED = speed end
+				end
+			end
+		end)
+	end
+	local folder = workspace:FindFirstChild("GunProjectiles")
+	if folder then table.insert(connections, folder.ChildAdded:Connect(track)) end
+	table.insert(connections, workspace.ChildAdded:Connect(function(c)
+		if c:IsA("BasePart") and c.Name == "Bullet" then track(c) end
+	end))
+end
+
+-- MAIN LOOP
+table.insert(connections, RunService.RenderStepped:Connect(function()
+	if not enabled then return end
+	updateESP()
+	local target = getBestTarget()
 	if target then
 		faceTarget(target)
 		autoAimAndFire(target)
 	end
+	updateCamera()
 end))
 
--- 👥 Player Tracking
+-- PLAYER HANDLING
 table.insert(connections, Players.PlayerAdded:Connect(function(p)
 	p.CharacterAdded:Connect(function() task.wait(1) createESP(p) end)
 end))
