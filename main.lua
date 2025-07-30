@@ -7,8 +7,6 @@ local Camera = workspace.CurrentCamera
 local LocalPlayer = Players.LocalPlayer
 
 -- SETTINGS
-local ESP_COLOR = Color3.fromRGB(255, 0, 0)        -- Custom ESP color (red)
-local TRACER_COLOR = Color3.fromRGB(0, 255, 0)     -- Custom tracer color (green)
 local LINE_THICKNESS = 1
 local ROTATE_SPEED = 0.15
 
@@ -25,7 +23,7 @@ local ESP = {}
 -- Script enabled toggle
 local enabled = true
 
--- DRAWING LINE HELPER
+-- Drawing helper with error handling
 local function newLine(color)
 	local success, line = pcall(function()
 		local l = Drawing.new("Line")
@@ -37,7 +35,7 @@ local function newLine(color)
 	if success then return line else return nil end
 end
 
--- GET JOINTS (works for R6 and R15)
+-- Get character joints (works for R6 and R15)
 local function getJoints(char)
 	local joints = {}
 	joints.Head = char:FindFirstChild("Head")
@@ -49,22 +47,22 @@ local function getJoints(char)
 	return joints
 end
 
--- CREATE ESP FOR A PLAYER
+-- Create ESP lines for a player
 local function createESP(player)
 	if player == LocalPlayer then return end
 	if ESP[player] then return end
 	local lines = {
-		Tracer = newLine(TRACER_COLOR),
-		HeadTorso = newLine(ESP_COLOR),
-		LeftArm = newLine(ESP_COLOR),
-		RightArm = newLine(ESP_COLOR),
-		LeftLeg = newLine(ESP_COLOR),
-		RightLeg = newLine(ESP_COLOR),
+		Tracer = newLine(Color3.new(1,1,1)), -- initial white, will be updated
+		HeadTorso = newLine(Color3.new(1,1,1)),
+		LeftArm = newLine(Color3.new(1,1,1)),
+		RightArm = newLine(Color3.new(1,1,1)),
+		LeftLeg = newLine(Color3.new(1,1,1)),
+		RightLeg = newLine(Color3.new(1,1,1)),
 	}
 	ESP[player] = lines
 end
 
--- REMOVE ESP
+-- Remove ESP lines for a player
 local function removeESP(player)
 	if ESP[player] then
 		for _, v in pairs(ESP[player]) do
@@ -76,7 +74,7 @@ local function removeESP(player)
 	end
 end
 
--- FIND NEAREST VALID TARGET
+-- Find nearest valid enemy (not teammate or friend)
 local function getNearestEnemy()
 	if not enabled then return nil end
 	local closest, minDist = nil, math.huge
@@ -85,7 +83,7 @@ local function getNearestEnemy()
 			if player.Team == LocalPlayer.Team then continue end
 			if LocalPlayer:IsFriendsWith(player.UserId) then continue end
 			local hrp = player.Character.HumanoidRootPart
-			local screenPos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+			local _, onScreen = Camera:WorldToViewportPoint(hrp.Position)
 			if not onScreen then continue end
 			local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
 			if dist < minDist then
@@ -97,7 +95,7 @@ local function getNearestEnemy()
 	return closest
 end
 
--- PREDICT ENEMY MOVEMENT
+-- Predict enemy movement for aiming
 local function getPredictedPosition(target)
 	if not enabled then return nil end
 	local targetChar = target.Character
@@ -111,7 +109,7 @@ local function getPredictedPosition(target)
 	return predicted
 end
 
--- FACE TOWARD TARGET
+-- Face your character toward the target position
 local function faceTarget(target)
 	if not enabled then return end
 	local myChar = LocalPlayer.Character
@@ -123,16 +121,15 @@ local function faceTarget(target)
 	myHRP.CFrame = myHRP.CFrame:Lerp(look, ROTATE_SPEED)
 end
 
--- AUTO-AIM TOOL + AUTO-FIRE (Uses Tool in Backpack)
+-- Auto-aim tool and auto-fire
 local lastFireTime = 0
-local FIRE_COOLDOWN = 0.3 -- seconds between shots
+local FIRE_COOLDOWN = 0.3 -- seconds
 
 local function autoAimToolAt(target)
 	if not enabled then return end
 	local backpack = LocalPlayer:FindFirstChild("Backpack")
 	if not backpack then return end
 
-	-- Find the first tool in backpack matching TOOL_NAMES
 	local tool
 	for _, item in ipairs(backpack:GetChildren()) do
 		if item:IsA("Tool") and table.find(TOOL_NAMES, item.Name) then
@@ -151,18 +148,16 @@ local function autoAimToolAt(target)
 	local direction = (predicted - handle.Position).Unit
 	handle.CFrame = CFrame.lookAt(handle.Position, handle.Position + direction)
 
-	-- Auto-fire when cooldown passed
 	local now = tick()
 	if now - lastFireTime >= FIRE_COOLDOWN then
 		lastFireTime = now
-
 		pcall(function()
 			tool:Activate()
 		end)
 	end
 end
 
--- AUTO-DETECT PROJECTILE SPEED (Prison Life specific)
+-- Auto-detect projectile speed for Prison Life
 local function setupProjectileSpeedDetector()
 	local gunProjectilesFolder = workspace:FindFirstChild("GunProjectiles")
 	
@@ -179,7 +174,7 @@ local function setupProjectileSpeedDetector()
 						local dt = endTime - startTime
 						if dt > 0 then
 							local speed = dist / dt
-							if speed > 5 then -- sanity check
+							if speed > 5 then
 								PROJECTILE_SPEED = speed
 								print("[AutoAim] Detected projectile speed:", math.floor(speed))
 							end
@@ -190,7 +185,6 @@ local function setupProjectileSpeedDetector()
 		end)
 	end
 	
-	-- Also listen for bullets spawned directly under workspace (sometimes Prison Life does this)
 	workspace.ChildAdded:Connect(function(bullet)
 		if bullet:IsA("BasePart") and bullet.Name == "Bullet" then
 			local startPos = bullet.Position
@@ -214,13 +208,15 @@ local function setupProjectileSpeedDetector()
 	end)
 end
 
--- TOGGLE HANDLER
+-- Chroma rainbow hue tracker
+local hue = 0
+
+-- Toggle keybind (RightControl)
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
 	if input.KeyCode == Enum.KeyCode.RightControl then
 		enabled = not enabled
 		if not enabled then
-			-- Hide all ESP when disabled
 			for _, lines in pairs(ESP) do
 				for _, line in pairs(lines) do
 					if line then
@@ -233,13 +229,15 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	end
 end)
 
--- MAIN LOOP
+-- Main loop for ESP update and auto aiming
 RunService.RenderStepped:Connect(function()
 	if not enabled then return end
 	local myChar = LocalPlayer.Character
 	local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
 
-	-- Update ESP
+	-- Update hue for rainbow
+	hue = (hue + 0.005) % 1
+
 	for player, lines in pairs(ESP) do
 		local char = player.Character
 		local joints = char and getJoints(char)
@@ -247,6 +245,14 @@ RunService.RenderStepped:Connect(function()
 		if char and joints and joints.Head and hrp then
 			local headPos, headVisible = Camera:WorldToViewportPoint(joints.Head.Position)
 			local torsoPos, torsoVisible = Camera:WorldToViewportPoint(hrp.Position)
+
+			-- Calculate colors with hue offsets
+			lines.HeadTorso.Color = Color3.fromHSV(hue, 1, 1)
+			lines.LeftArm.Color = Color3.fromHSV((hue + 0.1) % 1, 1, 1)
+			lines.RightArm.Color = Color3.fromHSV((hue + 0.2) % 1, 1, 1)
+			lines.LeftLeg.Color = Color3.fromHSV((hue + 0.3) % 1, 1, 1)
+			lines.RightLeg.Color = Color3.fromHSV((hue + 0.4) % 1, 1, 1)
+			lines.Tracer.Color = Color3.fromHSV((hue + 0.5) % 1, 1, 1)
 
 			lines.HeadTorso.Visible = headVisible and torsoVisible
 			if lines.HeadTorso.Visible then
@@ -280,7 +286,6 @@ RunService.RenderStepped:Connect(function()
 		end
 	end
 
-	-- Auto-Lock + Predictive Facing + Tool Aim + Auto-fire
 	local target = getNearestEnemy()
 	if target then
 		faceTarget(target)
@@ -288,7 +293,7 @@ RunService.RenderStepped:Connect(function()
 	end
 end)
 
--- PLAYER HANDLING
+-- Player added/removed handlers
 Players.PlayerAdded:Connect(function(p)
 	p.CharacterAdded:Connect(function()
 		wait(1)
@@ -298,7 +303,7 @@ end)
 
 Players.PlayerRemoving:Connect(removeESP)
 
--- INIT
+-- Initialize ESP for existing players
 for _, player in ipairs(Players:GetPlayers()) do
 	if player ~= LocalPlayer then
 		createESP(player)
